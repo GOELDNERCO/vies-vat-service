@@ -208,8 +208,8 @@ async def _query_vies(country_code: str, vat_number: str) -> dict:
         "valid": data.get("isValid", False),
         "country_code": country_code,
         "vat_number": vat_number,
-        "name": data.get("name", "---"),
-        "address": data.get("address", "---"),
+        "name": data.get("name", "---") or "---",
+        "address": data.get("address", "---") or "---",
         "request_date": data.get("requestDate"),
     }
 
