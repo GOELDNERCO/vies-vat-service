@@ -210,6 +210,7 @@ async def _query_vies(country_code: str, vat_number: str) -> dict:
         "vat_number": vat_number,
         "name": data.get("name", "---") or "---",
         "address": data.get("address", "---") or "---",
+        "user_error": data.get("userError"),
         "request_date": data.get("requestDate"),
     }
 
@@ -267,10 +268,22 @@ async def verify_vat(request: VerifyRequest):
     # 3. VIES abfragen
     vies_result = await _query_vies(country_code, vat_number)
 
+    # Länder, die grundsätzlich KEINE Name/Adress-Daten über VIES liefern
+    COUNTRIES_WITHOUT_DETAILS = {"DE", "ES", "EE", "NL"}
+    is_valid = vies_result.get("valid", False)
+    vat_is_invalid = not is_valid
+
     # 4. Abgleich der Kundendaten mit VIES-Ergebnis
     checks = {}
     vies_name = vies_result.get("name", "---")
     vies_address = vies_result.get("address", "---")
+
+    def _missing_data_hint() -> str:
+        if vat_is_invalid:
+            return "USt-IdNr. ist ungültig — VIES liefert deshalb keine Daten"
+        if country_code in COUNTRIES_WITHOUT_DETAILS:
+            return f"{country_code} liefert keine Daten über VIES"
+        return "Keine Daten von VIES zurückgegeben"
 
     # Name prüfen
     if request.company_name and vies_name != "---":
@@ -287,7 +300,7 @@ async def verify_vat(request: VerifyRequest):
             "vies_official": None,
             "similarity": None,
             "match": "NICHT_PRÜFBAR",
-            "hinweis": f"{country_code} liefert keine Namensdaten über VIES",
+            "hinweis": _missing_data_hint(),
         }
 
     # Adresse prüfen (Zusammenführung aller Adressfelder vom Kunden)
@@ -316,7 +329,7 @@ async def verify_vat(request: VerifyRequest):
             "vies_official": None,
             "similarity": None,
             "match": "NICHT_PRÜFBAR",
-            "hinweis": f"{country_code} liefert keine Adressdaten über VIES",
+            "hinweis": _missing_data_hint(),
         }
 
     # 5. Gesamtbewertung
