@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import re
 import time
 import unicodedata
@@ -13,8 +14,8 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="VIES VAT Validation Service",
-    description="Microservice zur Validierung von EU USt-IdNr. über die VIES REST API",
-    version="1.1.0",
+    description="Microservice zur Validierung von EU USt-IdNr. über VIES + BZSt eVatR",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -37,6 +38,8 @@ HISTORY: list[dict] = []
 HISTORY_MAX = 1000
 
 VIES_BASE = "https://ec.europa.eu/taxation_customs/vies/rest-api"
+BZST_BASE = "https://api.evatr.vies.bzst.de/app/v1"
+OWN_VAT_ID = os.environ.get("OWN_VAT_ID", "")  # Eigene deutsche USt-IdNr.
 
 # ---------------------------------------------------------------------------
 # Land → EU-Ländercode Mapping
@@ -93,6 +96,15 @@ class VerifyRequest(BaseModel):
     postal_code: Optional[str] = Field(None, description="PLZ vom Kunden")
     city: Optional[str] = Field(None, description="Stadt vom Kunden")
     country: Optional[str] = Field(None, description="Land (Name oder Code, z.B. 'Estonia' oder 'EE')")
+
+
+class BzstVerifyRequest(BaseModel):
+    """Qualifizierte Bestätigungsabfrage über BZSt eVatR."""
+    vat_number: str = Field(..., description="Zu prüfende USt-IdNr. (mit oder ohne Länderprefix)")
+    company_name: str = Field(..., description="Firmenname inkl. Rechtsform")
+    city: str = Field(..., description="Ort")
+    postal_code: Optional[str] = Field(None, description="PLZ")
+    street: Optional[str] = Field(None, description="Straße mit Hausnummer")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +197,90 @@ def _clean_vat_number(vat_number: str, country_code: str) -> str:
     return cleaned
 
 
+BZST_MATCH_CODES = {
+    "A": "stimmt überein",
+    "B": "stimmt NICHT überein",
+    "C": "nicht abgefragt",
+    "D": "vom EU-Mitgliedstaat nicht mitgeteilt",
+}
+
+
+async def _query_bzst(
+    vat_number: str,
+    company_name: str,
+    city: str,
+    postal_code: Optional[str] = None,
+    street: Optional[str] = None,
+) -> dict:
+    """Qualifizierte Bestätigungsabfrage beim BZSt (eVatR REST API)."""
+    if not OWN_VAT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="OWN_VAT_ID Umgebungsvariable nicht gesetzt. Eigene deutsche USt-IdNr. wird für BZSt-Abfragen benötigt.",
+        )
+
+    # VAT-Nummer mit Prefix zusammenbauen falls nötig
+    cleaned = vat_number.strip().replace(" ", "").replace(".", "").replace("-", "")
+
+    payload = {
+        "anfragendeUstid": OWN_VAT_ID,
+        "angefragteUstid": cleaned,
+        "firmenname": company_name,
+        "ort": city,
+    }
+    if postal_code:
+        payload["plz"] = postal_code
+    if street:
+        payload["strasse"] = street
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(f"{BZST_BASE}/abfrage", json=payload)
+
+    data = resp.json()
+
+    # BZSt Ergebnis-Codes für Adressfelder
+    erg_name = data.get("ergFirmenname")
+    erg_street = data.get("ergStrasse")
+    erg_plz = data.get("ergPlz")
+    erg_city = data.get("ergOrt")
+
+    checks = {}
+    if erg_name:
+        checks["firmenname"] = {"code": erg_name, "ergebnis": BZST_MATCH_CODES.get(erg_name, erg_name)}
+    if erg_street:
+        checks["strasse"] = {"code": erg_street, "ergebnis": BZST_MATCH_CODES.get(erg_street, erg_street)}
+    if erg_plz:
+        checks["plz"] = {"code": erg_plz, "ergebnis": BZST_MATCH_CODES.get(erg_plz, erg_plz)}
+    if erg_city:
+        checks["ort"] = {"code": erg_city, "ergebnis": BZST_MATCH_CODES.get(erg_city, erg_city)}
+
+    # Gesamtbewertung
+    codes = [erg_name, erg_street, erg_plz, erg_city]
+    codes = [c for c in codes if c and c not in ("C", "D")]
+    if not codes:
+        overall = "NICHT_PRÜFBAR"
+    elif "B" in codes:
+        overall = "ABWEICHUNG"
+    else:
+        overall = "OK"
+
+    result = {
+        "vat_valid": data.get("status") == "evatr-0000",
+        "status_code": data.get("status"),
+        "vat_number": cleaned,
+        "anfrage_zeitpunkt": data.get("anfrageZeitpunkt"),
+        "gueltig_ab": data.get("gueltigAb"),
+        "gueltig_bis": data.get("gueltigBis"),
+        "overall_result": overall,
+        "checks": checks,
+        "input": payload,
+        "bzst_raw": data,
+    }
+
+    _log({"type": "bzst", "vat_number": cleaned, "status": data.get("status"), "overall": overall})
+    return result
+
+
 async def _query_vies(country_code: str, vat_number: str) -> dict:
     """Fragt die VIES REST API ab (mit Cache)."""
     key = _cache_key(country_code, vat_number)
@@ -226,10 +322,12 @@ async def _query_vies(country_code: str, vat_number: str) -> dict:
 def root():
     return {
         "service": "VIES VAT Validation Service",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "validate": "GET /vat/{country_code}/{vat_number}",
-            "verify": "POST /vat/verify — Kundendaten gegenprüfen",
+            "verify": "POST /vat/verify — Kundendaten gegenprüfen (VIES)",
+            "bzst_verify": "POST /vat/bzst-verify — Qualifizierte Bestätigungsabfrage (BZSt)",
+            "bzst_status": "GET /vat/bzst-status — BZSt Statusmeldungen + EU-MS Verfügbarkeit",
             "bulk": "POST /vat/bulk",
             "history": "GET /history",
             "health": "GET /health",
@@ -359,6 +457,42 @@ async def verify_vat(request: VerifyRequest):
         },
         "cached": vies_result.get("cached", False),
     }
+
+
+@app.post("/vat/bzst-verify")
+async def bzst_verify(request: BzstVerifyRequest):
+    """Qualifizierte Bestätigungsabfrage beim BZSt — prüft USt-IdNr. mit Adressabgleich (Vertrauensschutz)."""
+    return await _query_bzst(
+        vat_number=request.vat_number,
+        company_name=request.company_name,
+        city=request.city,
+        postal_code=request.postal_code,
+        street=request.street,
+    )
+
+
+@app.get("/vat/bzst-status")
+async def bzst_status():
+    """BZSt Statusmeldungen und EU-Mitgliedstaaten-Verfügbarkeit abrufen."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        status_resp, ms_resp = await asyncio.gather(
+            client.get(f"{BZST_BASE}/info/statusmeldungen"),
+            client.get(f"{BZST_BASE}/info/eu_mitgliedstaaten"),
+            return_exceptions=True,
+        )
+
+    result = {}
+    if not isinstance(status_resp, Exception):
+        result["statusmeldungen"] = status_resp.json()
+    else:
+        result["statusmeldungen_error"] = str(status_resp)
+
+    if not isinstance(ms_resp, Exception):
+        result["eu_mitgliedstaaten"] = ms_resp.json()
+    else:
+        result["eu_mitgliedstaaten_error"] = str(ms_resp)
+
+    return result
 
 
 @app.post("/vat/bulk")
