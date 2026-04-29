@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="VIES VAT Validation Service",
     description="Microservice zur Validierung von EU USt-IdNr. über VIES + BZSt eVatR",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -40,6 +40,21 @@ HISTORY_MAX = 1000
 VIES_BASE = "https://ec.europa.eu/taxation_customs/vies/rest-api"
 BZST_BASE = "https://api.evatr.vies.bzst.de/app/v1"
 OWN_VAT_ID = os.environ.get("OWN_VAT_ID", "")  # Eigene deutsche USt-IdNr.
+
+# VIES userError-Codes, die KEINE inhaltliche Aussage über die VAT-Nummer machen,
+# sondern auf Verfügbarkeitsprobleme des EU-/MS-Systems hindeuten. Bei diesen Codes
+# ist isValid: false NICHT als „ungültige USt-IdNr." zu interpretieren.
+VIES_TRANSIENT_ERRORS = {
+    "MS_MAX_CONCURRENT_REQ",     # Mitgliedstaat-System hat Anfrage wegen zu vieler paralleler Anfragen abgewiesen
+    "MS_UNAVAILABLE",            # Mitgliedstaat-System nicht erreichbar
+    "SERVICE_UNAVAILABLE",       # VIES-Service insgesamt nicht erreichbar
+    "TIMEOUT",                   # Antwort vom Mitgliedstaat-System nicht rechtzeitig
+    "GLOBAL_MAX_CONCURRENT_REQ", # globales VIES-Rate-Limit
+    "SERVER_BUSY",               # Server überlastet
+}
+
+VIES_RETRY_ATTEMPTS = 4   # inkl. Erstversuch
+VIES_RETRY_BACKOFF = 1.5  # Sekunden, exponentiell
 
 # ---------------------------------------------------------------------------
 # Land → EU-Ländercode Mapping
@@ -281,37 +296,129 @@ async def _query_bzst(
     return result
 
 
+def _classify_vies_response(data: dict) -> str:
+    """Bestimmt den Status der VIES-Antwort.
+
+    Rückgabewerte:
+      - "valid":       isValid = true → USt-IdNr. ist gültig
+      - "unavailable": userError ist transient (MS-System überlastet/down)
+                       → KEINE inhaltliche Aussage möglich
+      - "invalid":     isValid = false und keine transiente Störung
+                       → USt-IdNr. ist (zum Abfragezeitpunkt) ungültig
+    """
+    user_error = (data.get("userError") or "").upper()
+    if data.get("isValid") is True:
+        return "valid"
+    if user_error in VIES_TRANSIENT_ERRORS:
+        return "unavailable"
+    return "invalid"
+
+
 async def _query_vies(country_code: str, vat_number: str) -> dict:
-    """Fragt die VIES REST API ab (mit Cache)."""
+    """Fragt die VIES REST API ab (mit Cache, Retry bei transienten MS-Fehlern).
+
+    Cached werden nur belastbare Ergebnisse (valid/invalid). „unavailable"-Antworten
+    werden NICHT gecached und bei Retry-Erschöpfung mit dem letzten userError zurückgegeben.
+    """
     key = _cache_key(country_code, vat_number)
     cached = _get_cached(key)
     if cached:
-        _log({"country_code": country_code, "vat_number": vat_number, "cached": True, "valid": cached.get("valid")})
+        _log({
+            "country_code": country_code,
+            "vat_number": vat_number,
+            "cached": True,
+            "status": cached.get("status"),
+            "valid": cached.get("valid"),
+        })
         return {**cached, "cached": True}
 
     url = f"{VIES_BASE}/ms/{country_code}/vat/{vat_number}"
 
+    last_data: Optional[dict] = None
+    last_status: Optional[str] = None
+    last_http_error: Optional[tuple[int, str]] = None
+
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url)
+        for attempt in range(VIES_RETRY_ATTEMPTS):
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError as exc:
+                last_http_error = (599, f"network error: {exc}")
+                last_status = "unavailable"
+                if attempt < VIES_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(VIES_RETRY_BACKOFF * (2 ** attempt))
+                    continue
+                break
 
-    if resp.status_code != 200:
-        error_detail = resp.text
-        _log({"country_code": country_code, "vat_number": vat_number, "cached": False, "error": error_detail})
-        raise HTTPException(status_code=resp.status_code, detail=f"VIES API error: {error_detail}")
+            if resp.status_code != 200:
+                last_http_error = (resp.status_code, resp.text)
+                # 5xx als transient behandeln und retry-en, sonst direkt abbrechen
+                if 500 <= resp.status_code < 600 and attempt < VIES_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(VIES_RETRY_BACKOFF * (2 ** attempt))
+                    continue
+                _log({
+                    "country_code": country_code,
+                    "vat_number": vat_number,
+                    "cached": False,
+                    "error": last_http_error[1],
+                })
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"VIES API error: {last_http_error[1]}",
+                )
 
-    data = resp.json()
+            last_data = resp.json()
+            last_status = _classify_vies_response(last_data)
+            if last_status != "unavailable" or attempt == VIES_RETRY_ATTEMPTS - 1:
+                break
+            await asyncio.sleep(VIES_RETRY_BACKOFF * (2 ** attempt))
+
+    # Wenn wir hier ohne Daten landen, war es ein dauerhaft transienter Netzwerk-/HTTP-Fehler
+    if last_data is None:
+        result = {
+            "valid": False,
+            "status": "unavailable",
+            "country_code": country_code,
+            "vat_number": vat_number,
+            "name": "---",
+            "address": "---",
+            "user_error": last_http_error[1] if last_http_error else "NETWORK_ERROR",
+            "request_date": datetime.now(timezone.utc).isoformat(),
+            "attempts": VIES_RETRY_ATTEMPTS,
+        }
+        _log({
+            "country_code": country_code,
+            "vat_number": vat_number,
+            "cached": False,
+            "status": "unavailable",
+            "valid": False,
+            "user_error": result["user_error"],
+        })
+        return {**result, "cached": False}
+
     result = {
-        "valid": data.get("isValid", False),
+        "valid": last_status == "valid",
+        "status": last_status,
         "country_code": country_code,
         "vat_number": vat_number,
-        "name": data.get("name", "---") or "---",
-        "address": data.get("address", "---") or "---",
-        "user_error": data.get("userError"),
-        "request_date": data.get("requestDate"),
+        "name": last_data.get("name", "---") or "---",
+        "address": last_data.get("address", "---") or "---",
+        "user_error": last_data.get("userError"),
+        "request_date": last_data.get("requestDate"),
     }
 
-    _set_cache(key, result)
-    _log({"country_code": country_code, "vat_number": vat_number, "cached": False, "valid": result["valid"]})
+    # Nur belastbare Ergebnisse cachen — transiente Antworten könnten kurz darauf gültig liefern
+    if last_status in ("valid", "invalid"):
+        _set_cache(key, result)
+
+    _log({
+        "country_code": country_code,
+        "vat_number": vat_number,
+        "cached": False,
+        "status": last_status,
+        "valid": result["valid"],
+        "user_error": result["user_error"],
+    })
     return {**result, "cached": False}
 
 
@@ -368,8 +475,9 @@ async def verify_vat(request: VerifyRequest):
 
     # Länder, die grundsätzlich KEINE Name/Adress-Daten über VIES liefern
     COUNTRIES_WITHOUT_DETAILS = {"DE", "ES", "EE", "NL"}
-    is_valid = vies_result.get("valid", False)
-    vat_is_invalid = not is_valid
+    vies_status = vies_result.get("status", "invalid")  # "valid" | "invalid" | "unavailable"
+    vies_unavailable = vies_status == "unavailable"
+    vat_is_invalid = vies_status == "invalid"
 
     # 4. Abgleich der Kundendaten mit VIES-Ergebnis
     checks = {}
@@ -377,6 +485,12 @@ async def verify_vat(request: VerifyRequest):
     vies_address = vies_result.get("address", "---")
 
     def _missing_data_hint() -> str:
+        if vies_unavailable:
+            user_error = vies_result.get("user_error") or "unbekannt"
+            return (
+                f"VIES/Mitgliedstaat-System aktuell nicht abrufbar (userError: {user_error}) — "
+                "USt-IdNr. konnte WEDER bestätigt NOCH widerlegt werden. Bitte später erneut prüfen."
+            )
         if vat_is_invalid:
             return "USt-IdNr. ist ungültig — VIES liefert deshalb keine Daten"
         if country_code in COUNTRIES_WITHOUT_DETAILS:
@@ -431,20 +545,25 @@ async def verify_vat(request: VerifyRequest):
         }
 
     # 5. Gesamtbewertung
-    all_checks = [c["match"] for c in checks.values()]
-    if not all_checks:
-        overall = "NUR_VALIDIERUNG"
-    elif "ABWEICHUNG" in all_checks:
-        overall = "ABWEICHUNG"
-    elif "NICHT_PRÜFBAR" in all_checks and "OK" not in all_checks:
+    if vies_unavailable:
+        # VIES konnte keine Aussage treffen — überschreibt alles andere.
         overall = "NICHT_PRÜFBAR"
-    elif "NICHT_PRÜFBAR" in all_checks:
-        overall = "TEILWEISE_PRÜFBAR"
     else:
-        overall = "OK"
+        all_checks = [c["match"] for c in checks.values()]
+        if not all_checks:
+            overall = "NUR_VALIDIERUNG"
+        elif "ABWEICHUNG" in all_checks:
+            overall = "ABWEICHUNG"
+        elif "NICHT_PRÜFBAR" in all_checks and "OK" not in all_checks:
+            overall = "NICHT_PRÜFBAR"
+        elif "NICHT_PRÜFBAR" in all_checks:
+            overall = "TEILWEISE_PRÜFBAR"
+        else:
+            overall = "OK"
 
-    return {
+    response = {
         "vat_valid": vies_result.get("valid", False),
+        "vies_status": vies_status,
         "country_code": country_code,
         "vat_number": vat_number,
         "vat_number_original": request.vat_number,
@@ -454,9 +573,13 @@ async def verify_vat(request: VerifyRequest):
             "name": vies_name,
             "address": vies_address,
             "request_date": vies_result.get("request_date"),
+            "user_error": vies_result.get("user_error"),
         },
         "cached": vies_result.get("cached", False),
     }
+    if vies_unavailable:
+        response["hinweis"] = _missing_data_hint()
+    return response
 
 
 @app.post("/vat/bzst-verify")
