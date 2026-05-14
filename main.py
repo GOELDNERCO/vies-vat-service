@@ -252,10 +252,11 @@ def _parse_einforma_html(raw: bytes, cif: str) -> Optional[dict]:
     if m:
         name = m.group(1).strip()
 
-    # Direccion social actual (registrierter Geschäftssitz)
+    # Registrierter Geschäftssitz — einforma nutzt je nach Layout entweder
+    # "Domicilio social actual" oder "Dirección social actual".
     street = None
     m = re.search(
-        r"Direcci[^<]*social actual:.*?</strong></td>\s*<td[^>]*>([^<]+?)(?:\s*<a|</td>)",
+        r"(?:Domicilio|Direcci[^<]*)\s+social\s+actual:.*?</strong></td>\s*<td[^>]*>([^<]+?)(?:\s*<a|</td>)",
         html, re.S | re.I,
     )
     if m:
