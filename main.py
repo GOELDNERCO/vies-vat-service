@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="VIES VAT Validation Service",
     description="Microservice zur Validierung von EU USt-IdNr. über VIES + BZSt eVatR",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -55,6 +55,17 @@ VIES_TRANSIENT_ERRORS = {
 
 VIES_RETRY_ATTEMPTS = 4   # inkl. Erstversuch
 VIES_RETRY_BACKOFF = 1.5  # Sekunden, exponentiell
+
+# Spanien (ES) liefert über VIES bewusst keine Stammdaten. Als Sekundärquelle für
+# Name/Adresse nutzen wir die öffentlich zugängliche einforma.com-Unternehmensseite
+# (best-effort, nicht-offiziell — siehe README).
+EINFORMA_BASE = "https://www.einforma.com"
+EINFORMA_PATH = "/servlet/app/portal/ENTP/prod/ETIQUETA_EMPRESA/nif"
+EINFORMA_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+ES_REGISTRY_CACHE_TTL_SECONDS = 86400  # 24 h — Registerdaten ändern sich selten
 
 # ---------------------------------------------------------------------------
 # Land → EU-Ländercode Mapping
@@ -210,6 +221,141 @@ def _clean_vat_number(vat_number: str, country_code: str) -> str:
     if cleaned.upper().startswith(country_code):
         cleaned = cleaned[len(country_code):]
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# ES Registry-Lookup (einforma.com)
+# ---------------------------------------------------------------------------
+ES_REGISTRY_CACHE: dict[str, dict] = {}
+
+
+def _parse_einforma_html(raw: bytes, cif: str) -> Optional[dict]:
+    """Extrahiert Stammdaten aus einer einforma.com-Unternehmensseite.
+
+    Die Seite ist ISO-8859-1 kodiert und liefert die relevanten Felder als
+    HTML-Snippets in einer Tabellenstruktur. Wir parsen defensiv via Regex —
+    wenn einforma die Struktur ändert, geben wir lieber `None` zurück als
+    halb-richtige Daten.
+    """
+    try:
+        html = raw.decode("iso-8859-1", errors="replace")
+    except Exception:
+        return None
+
+    # Hinweis: einforma zeigt für unbekannte CIFs eine Suchseite mit "no se
+    # encuentra" / "no encontrada" — in dem Fall haben wir keinen Treffer.
+    if re.search(r"no se encuentra|no encontrada|sin resultados", html, re.I):
+        return None
+
+    name = None
+    m = re.search(r"'nombreEmpresa':\s*'([^']+)'", html)
+    if m:
+        name = m.group(1).strip()
+
+    # Direccion social actual (registrierter Geschäftssitz)
+    street = None
+    m = re.search(
+        r"Direcci[^<]*social actual:.*?</strong></td>\s*<td[^>]*>([^<]+?)(?:\s*<a|</td>)",
+        html, re.S | re.I,
+    )
+    if m:
+        street = re.sub(r"\s+", " ", m.group(1)).strip().rstrip(",").strip()
+
+    # Localidad: PLZ + Stadt + (Provinz)
+    postal_code = None
+    city = None
+    province = None
+    m = re.search(
+        r"Localidad:</strong></td>\s*<td[^>]*>\s*(\d{5})\s+([^()<]+?)\s*\(\s*([^)]+?)\s*\)",
+        html, re.S | re.I,
+    )
+    if m:
+        postal_code = m.group(1)
+        city = m.group(2).strip()
+        province = m.group(3).strip()
+
+    # Wenn wir GAR nichts gefunden haben → vermutlich Captcha/Layoutwechsel
+    if not (name or street or postal_code or city):
+        return None
+
+    return {
+        "name": name,
+        "street": street,
+        "postal_code": postal_code,
+        "city": city,
+        "province": province,
+        "cif": cif.upper(),
+    }
+
+
+async def _query_es_registry(cif: str) -> dict:
+    """Holt Stammdaten einer spanischen Firma über einforma.com (öffentliche
+    Profilseite, ohne Login). Best-effort — bei Parsefehler/Captcha gibt es
+    `found: false` zurück, nie ein HTTPException, damit es als Fallback
+    aufgerufen werden kann ohne die Hauptantwort zu killen.
+    """
+    cif_normalized = cif.strip().upper().replace(" ", "")
+    if cif_normalized.startswith("ES"):
+        cif_normalized = cif_normalized[2:]
+
+    cached = ES_REGISTRY_CACHE.get(cif_normalized)
+    if cached and (time.time() - cached["ts"]) < ES_REGISTRY_CACHE_TTL_SECONDS:
+        return {**cached["data"], "cached": True}
+
+    url = f"{EINFORMA_BASE}{EINFORMA_PATH}/{cif_normalized}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            headers={"User-Agent": EINFORMA_UA, "Accept-Language": "es-ES,es;q=0.9"},
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        return {
+            "found": False,
+            "cif": cif_normalized,
+            "source": "einforma.com",
+            "source_url": url,
+            "error": f"network: {exc}",
+            "cached": False,
+        }
+
+    if resp.status_code != 200:
+        return {
+            "found": False,
+            "cif": cif_normalized,
+            "source": "einforma.com",
+            "source_url": url,
+            "error": f"http {resp.status_code}",
+            "cached": False,
+        }
+
+    parsed = _parse_einforma_html(resp.content, cif_normalized)
+    if parsed is None:
+        return {
+            "found": False,
+            "cif": cif_normalized,
+            "source": "einforma.com",
+            "source_url": url,
+            "error": "parse_failed_or_not_found",
+            "cached": False,
+        }
+
+    data = {
+        "found": True,
+        "cif": cif_normalized,
+        "name": parsed.get("name"),
+        "street": parsed.get("street"),
+        "postal_code": parsed.get("postal_code"),
+        "city": parsed.get("city"),
+        "province": parsed.get("province"),
+        "source": "einforma.com",
+        "source_url": url,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ES_REGISTRY_CACHE[cif_normalized] = {"data": data, "ts": time.time()}
+    return {**data, "cached": False}
 
 
 BZST_MATCH_CODES = {
@@ -429,12 +575,13 @@ async def _query_vies(country_code: str, vat_number: str) -> dict:
 def root():
     return {
         "service": "VIES VAT Validation Service",
-        "version": "1.2.0",
+        "version": app.version,
         "endpoints": {
             "validate": "GET /vat/{country_code}/{vat_number}",
-            "verify": "POST /vat/verify — Kundendaten gegenprüfen (VIES)",
+            "verify": "POST /vat/verify — Kundendaten gegenprüfen (VIES, mit ES-Registry-Fallback)",
             "bzst_verify": "POST /vat/bzst-verify — Qualifizierte Bestätigungsabfrage (BZSt)",
             "bzst_status": "GET /vat/bzst-status — BZSt Statusmeldungen + EU-MS Verfügbarkeit",
+            "es_registry": "GET /es/registry/{cif} — Stammdaten zu spanischer Firma (einforma.com)",
             "bulk": "POST /vat/bulk",
             "history": "GET /history",
             "health": "GET /health",
@@ -579,7 +726,79 @@ async def verify_vat(request: VerifyRequest):
     }
     if vies_unavailable:
         response["hinweis"] = _missing_data_hint()
+
+    # 6. ES-Registry-Fallback: wenn ES-VAT gültig ist und VIES keine Stammdaten
+    # liefert (was bei ES Standard ist), versuchen wir einforma.com als
+    # Sekundärquelle, um zumindest die registrierte Adresse zurückzuliefern.
+    if (
+        country_code == "ES"
+        and vies_status == "valid"
+        and (vies_name == "---" or not vies_name)
+    ):
+        registry = await _query_es_registry(vat_number)
+        response["registry_fallback"] = registry
+
+        # Wenn Kunde Name/Adresse mitgegeben hat, vergleichen wir on-the-fly
+        if registry.get("found"):
+            reg_checks = {}
+            if request.company_name and registry.get("name"):
+                score = _similarity(request.company_name, registry["name"])
+                reg_checks["name"] = {
+                    "customer_input": request.company_name,
+                    "registry_official": registry["name"],
+                    "similarity": round(score, 2),
+                    "match": "OK" if score >= 0.3 else "ABWEICHUNG",
+                }
+            reg_address_parts = [
+                p for p in [registry.get("street"), registry.get("postal_code"), registry.get("city")] if p
+            ]
+            reg_address_combined = ", ".join(reg_address_parts) if reg_address_parts else None
+            if customer_address_combined and reg_address_combined:
+                addr_score = _similarity(customer_address_combined, reg_address_combined)
+                plz_ok = (
+                    request.postal_code
+                    and registry.get("postal_code")
+                    and request.postal_code.strip() == registry["postal_code"]
+                )
+                city_ok = _contains_match(request.city, reg_address_combined) if request.city else None
+                reg_checks["address"] = {
+                    "customer_input": customer_address_combined,
+                    "registry_official": reg_address_combined,
+                    "similarity": round(addr_score, 2),
+                    "postal_code_match": plz_ok,
+                    "city_found": city_ok,
+                    "match": "OK" if addr_score >= 0.25 and plz_ok else "ABWEICHUNG",
+                }
+            if reg_checks:
+                response["registry_checks"] = reg_checks
+                # Wenn vorher NUR_VALIDIERUNG oder NICHT_PRÜFBAR und der Registry-Match
+                # eine Abweichung zeigt, das im Gesamtergebnis sichtbar machen.
+                reg_matches = [c["match"] for c in reg_checks.values()]
+                if overall in ("NUR_VALIDIERUNG", "NICHT_PRÜFBAR") and "ABWEICHUNG" in reg_matches:
+                    response["overall_result"] = "ABWEICHUNG"
+                elif overall == "NUR_VALIDIERUNG" and all(m == "OK" for m in reg_matches):
+                    response["overall_result"] = "OK"
+
     return response
+
+
+@app.get("/es/registry/{cif}")
+async def es_registry(cif: str):
+    """Stammdaten zu einer spanischen Firma aus einforma.com.
+
+    Spanien gibt über VIES bewusst keine Name-/Adressdaten frei. Dieser
+    Endpoint dient als ergänzende, **nicht-offizielle** Quelle, um den
+    registrierten Geschäftssitz prüfen zu können (z. B. für den
+    Vertrauensschutz-Adressabgleich).
+
+    Antwort:
+      - `found: true` mit Stammdaten oder
+      - `found: false` mit `error`-Hinweis (Captcha, parse failure etc.)
+
+    Cache: 24 h. Quelle ist „best-effort" — für die rechtssichere
+    Abfrage ist `/vat/bzst-verify` zu nutzen.
+    """
+    return await _query_es_registry(cif)
 
 
 @app.post("/vat/bzst-verify")
