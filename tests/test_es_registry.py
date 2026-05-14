@@ -35,6 +35,26 @@ def test_parse_einforma_extracts_fields():
     assert parsed["cif"] == "B16722811"
 
 
+def test_parse_einforma_handles_domicilio_label():
+    """Live-einforma nutzt 'Domicilio social actual' statt 'Dirección social actual'."""
+    html = (
+        b"<html><head><meta charset=\"ISO-8859-1\" />"
+        b"<script>dataLayer = [{'nombreEmpresa': 'ACME SL'}];</script></head><body>"
+        b"<tr><td><strong>Domicilio social actual:</strong></td>"
+        b"<td align=\"left\" valign=\"bottom\" width=\"70%\">CALLE FALSA, 123 "
+        b"<a href=\"/mapa\">Ver Mapa</a></td></tr>"
+        b"<tr><td><strong>Localidad:</strong></td>"
+        b"<td align=\"left\" valign=\"bottom\" width=\"70%\">28001 MADRID ( Madrid )</td></tr>"
+        b"</body></html>"
+    )
+    parsed = main._parse_einforma_html(html, "B99999999")
+    assert parsed is not None
+    assert parsed["name"] == "ACME SL"
+    assert parsed["street"] == "CALLE FALSA, 123"
+    assert parsed["postal_code"] == "28001"
+    assert parsed["city"] == "MADRID"
+
+
 def test_parse_einforma_handles_captcha_or_layout_break():
     # Wenn keine der erwarteten Felder existiert → None (statt halbgar)
     assert main._parse_einforma_html(b"<html><body>captcha required</body></html>", "B16722811") is None
