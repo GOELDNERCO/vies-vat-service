@@ -33,6 +33,32 @@ direkt aus diesem Repository. Stack: **FastAPI** + **httpx**, gehostet als Docke
 
 ## Versionshistorie
 
+### v1.4.0 — ES-Registry-Fallback (einforma.com)
+
+Spanien gibt über VIES bewusst **keine** Stammdaten (Name, Adresse) zu einer
+gültigen USt-IdNr. heraus. Das bricht den eigentlichen Zweck von `/vat/verify`
+für ES-Kunden — die Validität sagt allein nichts darüber aus, ob die vom Kunden
+angegebene Adresse mit dem registrierten Sitz übereinstimmt.
+
+**Neu:**
+
+- Endpoint `GET /es/registry/{cif}` liefert Stammdaten (Name, Straße, PLZ, Stadt,
+  Provinz) aus der öffentlich zugänglichen einforma.com-Unternehmensseite.
+- `/vat/verify` ruft den Fallback bei `country_code == "ES"` und `vies_status: valid`
+  automatisch auf und liefert das Ergebnis in `registry_fallback` zurück. Wenn
+  Kundendaten (Name/Adresse) im Request mitgegeben wurden, wird zusätzlich
+  `registry_checks` mit dem Abgleich beigelegt und `overall_result` aktualisiert.
+- Eigener 24-h-Cache (`ES_REGISTRY_CACHE`).
+
+**Wichtige Caveats:**
+
+- einforma.com ist **keine offizielle Quelle**. Für den rechtssicheren Adress-
+  abgleich (§ 6a UStG Vertrauensschutz) bleibt `/vat/bzst-verify` der Goldstandard.
+- Bei Captcha / Layout-Änderung gibt der Endpoint `found: false` zurück statt
+  einer Exception, damit `/vat/verify` weiter funktioniert.
+- Scraping kann gegen ToS verstoßen — vor produktivem Massenbetrieb ToS klären
+  oder auf bezahlte API umstellen (axesor.es, infoempresa.com, OpenCorporates).
+
 ### v1.3.0 — Korrekte Behandlung transienter VIES-Fehler
 
 VIES-Mitgliedstaat-Backends (insbesondere Frankreich und Italien während Lastspitzen)
@@ -83,9 +109,10 @@ Grundlegender VIES-Validator, Bulk-Endpoint, In-Memory-Cache, Request-History.
 | `GET`  | `/`                                  | Service-Info |
 | `GET`  | `/health`                            | Healthcheck (Cache-/History-Größe) |
 | `GET`  | `/vat/{country_code}/{vat_number}`   | Einzelne USt-IdNr. validieren |
-| `POST` | `/vat/verify`                        | Kundendaten gegen VIES gegenprüfen |
+| `POST` | `/vat/verify`                        | Kundendaten gegen VIES gegenprüfen (mit ES-Registry-Fallback) |
 | `POST` | `/vat/bzst-verify`                   | Qualifizierte Bestätigung beim BZSt |
 | `GET`  | `/vat/bzst-status`                   | BZSt-Statusmeldungen + MS-Verfügbarkeit |
+| `GET`  | `/es/registry/{cif}`                 | Stammdaten zu spanischer Firma (einforma.com) |
 | `POST` | `/vat/bulk`                          | Mehrere VAT-Nummern parallel (max. 50) |
 | `GET`  | `/history`                           | Letzte Abfragen (Audit) |
 
@@ -167,6 +194,71 @@ curl -X POST https://vies-vat-service-production.up.railway.app/vat/verify \
 > ⚠️ **Wichtig:** Vor v1.3.0 lieferte der Service bei MS-Überlast fälschlich
 > `vat_valid: false`. Implementierungen sollten jetzt zwingend `vies_status` auswerten
 > und bei `unavailable` neu anfragen statt eine Steuerentscheidung zu treffen.
+
+---
+
+## `/es/registry/{cif}` — Stammdaten zu spanischer Firma (einforma.com)
+
+Da Spanien über VIES keine Name-/Adressdaten herausgibt, ergänzt dieser Endpoint
+den registrierten Geschäftssitz aus der öffentlich zugänglichen
+einforma.com-Profilseite. Akzeptiert sowohl `B12345678` als auch `ESB12345678`.
+
+```bash
+curl https://vies-vat-service-production.up.railway.app/es/registry/B16722811
+```
+
+### Antwort (Treffer)
+
+```json
+{
+  "found":         true,
+  "cif":           "B16722811",
+  "name":          "COMISSO & SABAT ASOCIADOS S.L.",
+  "street":        "CALLE JOAN MIRO, 59",
+  "postal_code":   "08320",
+  "city":          "EL MASNOU",
+  "province":      "Barcelona",
+  "source":        "einforma.com",
+  "source_url":    "https://www.einforma.com/servlet/app/portal/ENTP/prod/ETIQUETA_EMPRESA/nif/B16722811",
+  "retrieved_at":  "2026-05-14T15:42:11Z",
+  "cached":        false
+}
+```
+
+### Antwort (kein Treffer / Captcha / Layout-Fehler)
+
+```json
+{
+  "found":      false,
+  "cif":        "B00000000",
+  "source":     "einforma.com",
+  "source_url": "https://www.einforma.com/servlet/.../B00000000",
+  "error":      "parse_failed_or_not_found"
+}
+```
+
+### Automatische Integration in `/vat/verify`
+
+Bei ES-Kunden mit gültiger VAT wird der Registry-Lookup automatisch durchgeführt
+und unter `registry_fallback` (+ optional `registry_checks`) in der `/vat/verify`-
+Antwort beigelegt:
+
+```json
+{
+  "vat_valid":     true,
+  "vies_status":   "valid",
+  "country_code":  "ES",
+  "registry_fallback": { "found": true, "name": "...", "street": "...", "postal_code": "...", "city": "..." },
+  "registry_checks":   {
+    "name":    { "customer_input": "...", "registry_official": "...", "similarity": 1.0, "match": "OK" },
+    "address": { "customer_input": "...", "registry_official": "...", "similarity": 0.34, "postal_code_match": false, "match": "ABWEICHUNG" }
+  },
+  "overall_result": "ABWEICHUNG"
+}
+```
+
+> ⚠️ einforma.com ist **keine offizielle Quelle**. Für rechtssicheren
+> Vertrauensschutz nach § 6a UStG bleibt `/vat/bzst-verify` der Goldstandard.
 
 ---
 
